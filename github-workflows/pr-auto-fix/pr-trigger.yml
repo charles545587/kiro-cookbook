@@ -1,0 +1,734 @@
+name: Kiro PR Comment Auto-Fix
+
+# Auto-fix loop for PR review comments authored by trusted bots.
+#
+# Triggers:
+#   - PR conversation comments from trusted bots
+#   - PR review submissions from trusted bots
+#   - Inline review comments from trusted bots
+#   - Manual dispatch for a specific PR
+#
+# Safety:
+#   - The real work runs under a per-PR concurrency group. The heads-up
+#     announcement runs in a SEPARATE job *outside* the group so posting the
+#     comment cannot re-enter the group (the announce comment would otherwise
+#     cancel the auto-fix run via cancel-in-progress).
+#   - The trusted-bots allowlist prevents arbitrary commenters from
+#     triggering the workflow.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to sweep for unresolved findings"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Separate, fast-running job that posts the "Kiro is on it" heads-up comment.
+  # Runs OUTSIDE the `auto-fix` job's concurrency group — see the header
+  # comment at the top of this file.
+  announce:
+    if: >
+      (
+        (github.event_name == 'workflow_dispatch')
+        ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
+          (github.event.comment.user.login == 'aws-security-agent[bot]' ||
+           github.event.comment.user.login == 'amazon-q-developer[bot]'))
+        ||
+        (github.event_name == 'pull_request_review' &&
+          (github.event.review.user.login == 'aws-security-agent[bot]' ||
+           github.event.review.user.login == 'amazon-q-developer[bot]'))
+        ||
+        (github.event_name == 'pull_request_review_comment' &&
+          (github.event.comment.user.login == 'aws-security-agent[bot]' ||
+           github.event.comment.user.login == 'amazon-q-developer[bot]'))
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip trivial status comments from bots
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_BODY: ${{ github.event.comment.body }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          REVIEW_USER: ${{ github.event.review.user.login }}
+        run: |
+          # Mirror the content filter from the auto-fix job so we never post a
+          # "Kiro is reviewing..." heads-up in response to the bots' own
+          # transient status noise ("AWS Security Agent is reviewing your pull
+          # request and will post feedback shortly.", "No issues identified.",
+          # etc). Without this, every scan that ends cleanly produces a pair
+          # of useless comments (bot noise + our heads-up) that burn LLM
+          # tokens when the auto-fix job wakes up.
+          case "$EVENT_NAME" in
+            issue_comment|pull_request_review_comment) body="$ISSUE_BODY"; author="$COMMENT_USER" ;;
+            pull_request_review)                      body="$REVIEW_BODY"; author="$REVIEW_USER" ;;
+            workflow_dispatch)                        body=""; author="manual" ;;
+            *)                                        body=""; author="" ;;
+          esac
+
+          # Author-based check (primary): skip anything our own fixer bots
+          # authored, to avoid self-trigger loops even though the concurrency
+          # split already protects against re-entry.
+          if printf '%s' "$author" | grep -Eq '^(kiro-fixer\[bot\]|kiro-pr-fixer-[^[:space:]]+|github-actions\[bot\])$'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: comment authored by $author (own bot)."
+          # Content-based check: skip the well-known trivial status strings
+          # the AWS Security Agent and Amazon Q Developer bots emit around
+          # the start and end of their reviews. Keep in sync with the
+          # identical filter in the auto-fix job.
+          elif printf '%s' "$body" | grep -Eiq '^(\[kiro\]|Kiro is reviewing|AWS Security Agent is reviewing|No issues identified\.?$|Amazon Q Developer.*is analysing)'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: trivial status comment."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint app token if app credentials are configured
+        id: app-token
+        if: steps.filter.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KIRO_FIXER_APP_ID }}
+          private-key: ${{ secrets.KIRO_FIXER_PRIVATE_KEY }}
+
+      - name: Resolve effective token
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ -n "$APP_TOKEN" ]; then
+            echo "::add-mask::$APP_TOKEN"
+            echo "EFFECTIVE_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+            echo "EFFECTIVE_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Resolve PR number, author, and source
+        id: pr_meta
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_PR_NUMBER: ${{ github.event.issue.number }}
+          REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+          DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+        run: |
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              echo "pr_number=$DISPATCH_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=manual" >> "$GITHUB_OUTPUT"
+              echo "source=manual_dispatch" >> "$GITHUB_OUTPUT"
+              ;;
+            issue_comment)
+              echo "pr_number=$ISSUE_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$ISSUE_COMMENT_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=conversation_comment" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request_review)
+              echo "pr_number=$REVIEW_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$REVIEW_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=review_summary" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request_review_comment)
+              echo "pr_number=$REVIEW_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$ISSUE_COMMENT_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=inline_review_comment" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Post heads-up comment
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          AUTHOR: ${{ steps.pr_meta.outputs.author }}
+          SOURCE: ${{ steps.pr_meta.outputs.source }}
+        run: |
+          # Gives reviewers immediate visual feedback that the workflow
+          # kicked off. The comment comes from the Kiro fixer bot account
+          # (or github-actions[bot] if the app isn't configured), so it's
+          # distinguishable from human comments by author login alone.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+            "Kiro is reviewing the ${SOURCE} from \`${AUTHOR}\` and will post fixes shortly."
+
+  auto-fix:
+    # Fire on PR conversation comments, PR review summaries, inline review
+    # comments authored by the two bots we trust, or on manual dispatch.
+    #
+    # `always()` ensures a failed announce job doesn't block the real work.
+    if: >
+      always() && (
+        (github.event_name == 'workflow_dispatch')
+        ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
+          (github.event.comment.user.login == 'aws-security-agent[bot]' ||
+           github.event.comment.user.login == 'amazon-q-developer[bot]'))
+        ||
+        (github.event_name == 'pull_request_review' &&
+          (github.event.review.user.login == 'aws-security-agent[bot]' ||
+           github.event.review.user.login == 'amazon-q-developer[bot]'))
+        ||
+        (github.event_name == 'pull_request_review_comment' &&
+          (github.event.comment.user.login == 'aws-security-agent[bot]' ||
+           github.event.comment.user.login == 'amazon-q-developer[bot]'))
+      )
+    needs: announce
+    runs-on: ubuntu-latest
+
+    # Concurrency group limits this job to one active run per PR. The
+    # `announce` job above is deliberately outside this group — see the
+    # header comment at the top of this file.
+    concurrency:
+      group: kiro-pr-fix-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Mint app token if app credentials are configured
+        id: app-token
+        # We always run this step. If KIRO_FIXER_APP_ID is empty (i.e. the
+        # app hasn't been set up yet), the action fails softly via
+        # continue-on-error and `steps.app-token.outputs.token` stays empty,
+        # which lets the resolver step below fall back to GITHUB_TOKEN.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KIRO_FIXER_APP_ID }}
+          private-key: ${{ secrets.KIRO_FIXER_PRIVATE_KEY }}
+
+      - name: Resolve effective token
+        id: tok
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Prefer the app token (has the `workflows` permission) when
+          # available, otherwise fall back to the default GITHUB_TOKEN
+          # (which can't push workflow-file edits but handles everything
+          # else fine). We DO NOT echo tokens to step outputs - step outputs
+          # are visible in logs. Instead we write the effective token to an
+          # env file and expose it via $GITHUB_ENV.
+          if [ -n "$APP_TOKEN" ]; then
+            echo "Using Kiro fixer app token (app-id configured)."
+            echo "::add-mask::$APP_TOKEN"
+            echo "EFFECTIVE_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+            echo "git_user_name=kiro-fixer[bot]" >> "$GITHUB_OUTPUT"
+            echo "git_user_email=kiro-fixer[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+            echo "using_app_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Falling back to default GITHUB_TOKEN."
+            echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+            echo "EFFECTIVE_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+            echo "git_user_name=kiro-pr-fix-bot" >> "$GITHUB_OUTPUT"
+            echo "git_user_email=41898282+github-actions[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+            echo "using_app_token=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PR number and author
+        id: pr_meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_PR_NUMBER: ${{ github.event.issue.number }}
+          REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          REVIEW_AUTHOR: ${{ github.event.review.user.login }}
+          DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          DISPATCH_ACTOR: ${{ github.actor }}
+        run: |
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              echo "pr_number=$DISPATCH_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$DISPATCH_ACTOR" >> "$GITHUB_OUTPUT"
+              echo "source=manual_dispatch" >> "$GITHUB_OUTPUT"
+              ;;
+            issue_comment)
+              echo "pr_number=$ISSUE_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$ISSUE_COMMENT_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=conversation_comment" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request_review)
+              echo "pr_number=$REVIEW_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$REVIEW_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=review_summary" >> "$GITHUB_OUTPUT"
+              ;;
+            pull_request_review_comment)
+              echo "pr_number=$REVIEW_PR_NUMBER" >> "$GITHUB_OUTPUT"
+              echo "author=$ISSUE_COMMENT_AUTHOR" >> "$GITHUB_OUTPUT"
+              echo "source=inline_review_comment" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Skip trivial status comments from bots
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_BODY: ${{ github.event.comment.body }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
+          REVIEW_USER: ${{ github.event.review.user.login }}
+        run: |
+          case "$EVENT_NAME" in
+            issue_comment|pull_request_review_comment) body="$ISSUE_BODY"; author="$COMMENT_USER" ;;
+            pull_request_review)                      body="$REVIEW_BODY"; author="$REVIEW_USER" ;;
+            *)                                        body=""; author="" ;;
+          esac
+
+          # Defence in depth. Two reasons to skip:
+          # 1. Author-based: the comment was posted by our own fixer bots
+          #    (kiro-fixer[bot], kiro-pr-fixer-*, or github-actions[bot]).
+          # 2. Content-based: bots post "I am reviewing..." status messages
+          #    that aren't actionable findings.
+          #
+          # We keep the legacy `[kiro]` prefix match in (2) so historical
+          # comments are still recognised, but new comments are identified
+          # by author login.
+          if printf '%s' "$author" | grep -Eq '^(kiro-fixer\[bot\]|kiro-pr-fixer-[^[:space:]]+|github-actions\[bot\])$'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: comment authored by $author (own bot)."
+          elif printf '%s' "$body" | grep -Eiq '^(\[kiro\]|Kiro is reviewing|AWS Security Agent is reviewing|No issues identified\.?$|Amazon Q Developer.*is analysing)'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: trivial status comment."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Capture PR head metadata
+        id: pr
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json headRefName,headRefOid,isCrossRepository,state,mergedAt > pr.json
+
+          state=$(jq -r '.state' pr.json)
+          merged_at=$(jq -r '.mergedAt // empty' pr.json)
+          head_ref=$(jq -r '.headRefName' pr.json)
+
+          # If the PR is closed or merged, its head branch is very likely gone.
+          # Bail out cleanly so we don't produce a red run for a comment the
+          # bots posted on a PR that has already shipped.
+          if [ "$state" != "OPEN" ] || [ -n "$merged_at" ]; then
+            echo "PR #$PR_NUMBER is $state (mergedAt=$merged_at). Nothing to fix."
+            echo "pr_closed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Also verify the branch actually still exists on the remote — the
+          # user may have deleted it manually even on an open PR.
+          # NB: $head_ref comes from `gh pr view` (GitHub's own API output),
+          # not from any user-controlled comment body, so plain interpolation
+          # is safe here. An earlier attempt to use `gh api -X GET` with
+          # `{branch}` as a path template + `-F branch=...` failed because
+          # `{branch}` is a reserved placeholder that gh tries to resolve
+          # from the local git context, which doesn't exist this early in
+          # the job (before checkout).
+          if ! gh api "repos/$REPO/branches/$head_ref" >/dev/null 2>&1; then
+            echo "Head branch '$head_ref' no longer exists on the remote."
+            echo "pr_closed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "head_ref=$head_ref"
+            echo "head_sha=$(jq -r '.headRefOid' pr.json)"
+            echo "is_fork=$(jq -r '.isCrossRepository' pr.json)"
+            echo "pr_closed=false"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stop if PR comes from a fork
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.pr_closed != 'true' && steps.pr.outputs.is_fork == 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "Saw a review from a bot, but this PR comes from a fork so I can't safely push an automatic fix."
+          exit 0
+
+      - name: Checkout PR head
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.pr.outputs.head_ref }}
+          # Use our effective token (app token when configured, else
+          # GITHUB_TOKEN) so the push later in the workflow reuses the
+          # same git credential baked in by actions/checkout.
+          token: ${{ env.EFFECTIVE_TOKEN }}
+
+      - name: Install Kiro CLI
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        run: curl -fsSL https://cli.kiro.dev/install | bash
+
+      - name: Collect unresolved findings from trusted bots
+        id: findings
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Pull every inline review comment on the PR via the REST API, then
+          # filter to unresolved comments authored by one of the trusted bots.
+          # The REST endpoint doesn't expose "resolved" state directly, so we
+          # ask the GraphQL API for review threads and intersect.
+          owner="${REPO%/*}"
+          name="${REPO#*/}"
+
+          # 1. Review threads (GraphQL) — gives us isResolved + comment IDs.
+          gh api graphql -f query='
+            query($owner:String!, $name:String!, $number:Int!) {
+              repository(owner:$owner, name:$name) {
+                pullRequest(number:$number) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      isResolved
+                      comments(first: 50) {
+                        nodes {
+                          databaseId
+                          author { login }
+                          body
+                          path
+                          url
+                          line
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -F owner="$owner" -F name="$name" -F number="$PR_NUMBER" > threads.json
+
+          # 2. Reduce to the first comment in each unresolved thread authored
+          #    by a trusted bot that has NOT already received a fixer-bot
+          #    reply. We identify our own replies by author login (any of the
+          #    fixer bot accounts) as the primary signal, and accept the
+          #    legacy [kiro] prefix as a secondary signal for historical
+          #    comments that predate the author-based check.
+          jq '
+            [ .data.repository.pullRequest.reviewThreads.nodes[]
+              | select(.isResolved == false)
+              | select(
+                  (.comments.nodes[0].author.login == "amazon-q-developer")
+                  or (.comments.nodes[0].author.login == "aws-security-agent")
+                )
+              | select(
+                  [ .comments.nodes[]
+                    | select(
+                        (.author.login | test("^(kiro-fixer|kiro-pr-fixer-|github-actions)"))
+                        or (.body | startswith("[kiro]"))
+                      )
+                  ] | length == 0
+                )
+              | .comments.nodes[0]
+              | {
+                  comment_id: .databaseId,
+                  author:     .author.login,
+                  path:       .path,
+                  line:       .line,
+                  url:        .url,
+                  body:       .body
+                }
+            ]
+          ' threads.json > findings.json
+
+          count=$(jq 'length' findings.json)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Collected $count unresolved finding(s) from trusted bots that do not yet have a fixer-bot reply."
+
+      - name: Save reviewer context to file
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          AUTHOR: ${{ steps.pr_meta.outputs.author }}
+          SOURCE: ${{ steps.pr_meta.outputs.source }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          COMMENT_LINE: ${{ github.event.comment.line }}
+        run: |
+          {
+            echo "Source: $SOURCE"
+            echo "Author: $AUTHOR"
+            echo "PR: #$PR_NUMBER"
+            case "$EVENT_NAME" in
+              workflow_dispatch)
+                echo
+                echo "This run was triggered manually by $AUTHOR with no specific review"
+                echo "comment attached. Your job is to sweep up every entry in"
+                echo "findings.json and resolve each one."
+                ;;
+              issue_comment|pull_request_review_comment)
+                echo "URL: $COMMENT_URL"
+                if [ -n "$COMMENT_PATH" ]; then
+                  echo "File: $COMMENT_PATH"
+                  echo "Line: $COMMENT_LINE"
+                fi
+                echo
+                echo "Body:"
+                echo "$COMMENT_BODY"
+                ;;
+              pull_request_review)
+                echo "URL: $REVIEW_URL"
+                echo
+                echo "Body:"
+                echo "$REVIEW_BODY"
+                ;;
+            esac
+          } > reviewer-comment.txt
+
+          echo "Wrote reviewer-comment.txt ($(wc -c < reviewer-comment.txt) bytes)"
+
+      - name: Run Kiro in headless mode
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_SECRET }}
+        run: |
+          kiro-cli chat \
+            --no-interactive \
+            --trust-all-tools \
+            "You are fixing issues in a GitHub pull request based on automated review feedback.
+
+          Inputs on disk:
+          - reviewer-comment.txt: the comment/review that triggered this run.
+          - findings.json: a JSON array of every unresolved inline finding on
+            this PR from trusted bots. Each entry has: comment_id, author,
+            path, line, url, body.
+
+          Your job:
+          1. Inspect the repository and make the code changes needed to resolve
+             every finding in findings.json where practical. Also address
+             anything extra mentioned in reviewer-comment.txt.
+          2. After editing, write a file called kiro-replies.json in the repo
+             root. It must be a JSON array where each element mirrors a finding
+             you addressed and has exactly these keys:
+               - comment_id: the numeric comment_id from findings.json
+               - status: one of 'resolved', 'partial', or 'unresolved'
+               - explanation: a one or two sentence plain-text explanation of
+                 what you changed (or why you couldn't). No markdown, no code
+                 fences.
+             Only include entries for findings you actually considered.
+          3. Also write output-summary.md: a short markdown bullet list of the
+             overall changes, for the top-level PR summary comment.
+
+          kiro-replies.json and output-summary.md are required. If you make no
+          code changes, still write them and mark every entry 'unresolved' with
+          an explanation."
+
+      - name: Capture Kiro outputs before commit
+        id: outputs
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        run: |
+          if [ -f kiro-replies.json ]; then
+            cp kiro-replies.json "${RUNNER_TEMP}/kiro-replies.json"
+          else
+            echo '[]' > "${RUNNER_TEMP}/kiro-replies.json"
+          fi
+          echo "replies_path=${RUNNER_TEMP}/kiro-replies.json" >> "$GITHUB_OUTPUT"
+
+          if [ -f output-summary.md ]; then
+            cp output-summary.md "${RUNNER_TEMP}/output-summary.md"
+          else
+            printf '%s\n' "- Applied an automated fix based on the review." \
+              > "${RUNNER_TEMP}/output-summary.md"
+          fi
+          echo "summary_path=${RUNNER_TEMP}/output-summary.md" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changes
+        id: changes
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        run: |
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push fixes
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true' && steps.changes.outputs.changed == 'true'
+        id: commit
+        env:
+          AUTHOR: ${{ steps.pr_meta.outputs.author }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          git config user.name  "${{ steps.tok.outputs.git_user_name }}"
+          git config user.email "${{ steps.tok.outputs.git_user_email }}"
+
+          # Drop workflow artefacts so they don't leak into the commit.
+          rm -f reviewer-comment.txt output-summary.md kiro-replies.json pr.json threads.json findings.json pr-response.md
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No diffs to commit."
+            echo "commit_sha=" >> "$GITHUB_OUTPUT"
+            echo "commit_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "fix: address review feedback from $AUTHOR"
+
+          # GitHub refuses to let the default GITHUB_TOKEN push changes to
+          # files under .github/workflows/ unless the token carries the
+          # `workflow` scope. If Kiro's fix happens to touch a workflow file
+          # (common when the bots review the workflows themselves), the push
+          # will be rejected with:
+          #   refusing to allow a GitHub App to create or update workflow ...
+          #     without `workflows` permission
+          # Detect that case, undo the commit so the branch stays clean, and
+          # fall through to a graceful fallback that posts a comment instead
+          # of pushing.
+          push_log="$(mktemp)"
+          if ! git push origin "HEAD:$HEAD_REF" 2>&1 | tee "$push_log"; then
+            if grep -q "without .workflows. permission" "$push_log"; then
+              echo "push_blocked_by_workflow_scope=true" >> "$GITHUB_OUTPUT"
+              # Roll the commit back locally so subsequent steps don't think
+              # a fix was applied. The commit never made it to remote anyway.
+              git reset --soft HEAD^
+              echo "commit_sha=" >> "$GITHUB_OUTPUT"
+              echo "commit_url=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Any other push failure is still a real error.
+            exit 1
+          fi
+
+          sha=$(git rev-parse HEAD)
+          echo "commit_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "commit_url=$SERVER_URL/$REPO/commit/$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Post reply on each finding thread
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          REPLIES_PATH: ${{ steps.outputs.outputs.replies_path }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
+        run: |
+          owner="${REPO%/*}"
+          name="${REPO#*/}"
+
+          replies_count=$(jq 'length' "$REPLIES_PATH")
+          echo "Kiro produced $replies_count per-finding reply entries."
+
+          if [ "$replies_count" = "0" ]; then
+            exit 0
+          fi
+
+          # Iterate each { comment_id, status, explanation } entry and POST a
+          # threaded reply via the PR review-comment replies endpoint. The
+          # reply author is one of our fixer bot accounts, so it's
+          # identifiable by author login alone — no [kiro] prefix required.
+          jq -c '.[]' "$REPLIES_PATH" | while read -r entry; do
+            cid=$(printf '%s' "$entry" | jq -r '.comment_id // empty')
+            status=$(printf '%s' "$entry" | jq -r '.status // "resolved"')
+            explanation=$(printf '%s' "$entry" | jq -r '.explanation // ""')
+
+            if [ -z "$cid" ] || [ "$cid" = "null" ]; then
+              echo "Skipping entry with no comment_id: $entry"
+              continue
+            fi
+
+            # Label the prefix according to status, for skim-readability of
+            # the threaded reply. This prefix is cosmetic — the real identity
+            # signal is the reply author (kiro-fixer[bot] or similar).
+            case "$status" in
+              resolved)   prefix="Resolved" ;;
+              partial)    prefix="Partial"  ;;
+              unresolved) prefix="Unresolved" ;;
+              *)          prefix="Resolved" ;;
+            esac
+
+            body="$prefix: $explanation"
+            if [ -n "$COMMIT_SHA" ]; then
+              body="$body
+
+          Fix commit: [\`${COMMIT_SHA:0:7}\`]($COMMIT_URL)"
+            fi
+
+            echo "Replying on comment $cid ($status)..."
+            printf '%s' "$body" \
+              | gh api \
+                  --method POST \
+                  -H "Accept: application/vnd.github+json" \
+                  "repos/$owner/$name/pulls/$PR_NUMBER/comments/$cid/replies" \
+                  -F body=@- \
+              || echo "Reply to $cid failed (continuing)."
+          done
+
+      - name: Post top-level summary comment
+        if: steps.filter.outputs.skip != 'true' && steps.pr.outputs.is_fork != 'true' && steps.pr.outputs.pr_closed != 'true'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr_meta.outputs.pr_number }}
+          AUTHOR: ${{ steps.pr_meta.outputs.author }}
+          SOURCE: ${{ steps.pr_meta.outputs.source }}
+          ORIGINAL_URL: ${{ github.event.comment.html_url || github.event.review.html_url }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          COMMIT_URL: ${{ steps.commit.outputs.commit_url }}
+          PUSH_BLOCKED: ${{ steps.commit.outputs.push_blocked_by_workflow_scope }}
+          USING_APP_TOKEN: ${{ steps.tok.outputs.using_app_token }}
+          SUMMARY_PATH: ${{ steps.outputs.outputs.summary_path }}
+          CHANGED: ${{ steps.changes.outputs.changed }}
+        run: |
+          {
+            if [ "$PUSH_BLOCKED" = "true" ]; then
+              echo "Tried to address ${SOURCE} from \`${AUTHOR}\`, but GitHub rejected the push because the fix touches a file under \`.github/workflows/\`."
+              if [ "$USING_APP_TOKEN" = "true" ]; then
+                echo
+                echo "This is unexpected because this run used the Kiro fixer GitHub App, which should have the \`workflows: write\` permission. Check that the app still has the Workflows permission in its settings and is still installed on this repository."
+              else
+                echo
+                echo "This run fell back to the default \`GITHUB_TOKEN\`, which can't push workflow-file edits. Set the \`KIRO_FIXER_APP_ID\` and \`KIRO_FIXER_PRIVATE_KEY\` repository secrets to use the Kiro fixer GitHub App instead."
+              fi
+              echo
+              echo "The proposed changes were rolled back locally and not pushed."
+              echo
+              echo "Summary of what Kiro wanted to change:"
+              cat "$SUMMARY_PATH"
+            elif [ "$CHANGED" = "true" ] && [ -n "$COMMIT_SHA" ]; then
+              echo "Addressed ${SOURCE} from \`${AUTHOR}\`."
+              echo
+              cat "$SUMMARY_PATH"
+              echo
+              echo "Fix commit: [\`${COMMIT_SHA:0:7}\`]($COMMIT_URL)"
+            else
+              echo "Reviewed feedback from \`${AUTHOR}\`, but didn't produce a code change. The finding may already be addressed, may need manual intervention, or may require a broader design decision."
+            fi
+
+            if [ -n "$ORIGINAL_URL" ]; then
+              echo
+              echo "Original: $ORIGINAL_URL"
+            fi
+          } > pr-response.md
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file pr-response.md
