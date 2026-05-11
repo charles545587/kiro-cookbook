@@ -8,9 +8,31 @@ Each recipe here is a complete, working example you can drop into your own proje
 
 ### GitHub Actions workflows
 
-- **[PR auto-fix](github-workflows/pr-auto-fix/)** — A workflow that reads unresolved findings from trusted review bots (AWS Security Agent, Amazon Q Developer) and uses Kiro's headless mode to write fixes, commit them, and reply inline on each thread.
+- **[PR auto-fix](github-workflows/pr-auto-fix/)** — When a trusted review bot (AWS Security Agent, Amazon Q Developer) leaves unresolved findings on a pull request, Kiro reads them, writes fixes, commits to the PR branch, and posts threaded replies on each original finding. The closing minutes of a PR, handled automatically.
 
-*More recipes coming soon: issue-to-spec conversion, scheduled code review, release notes generation, steering document patterns.*
+- **[Spec-driven development](github-workflows/spec-driven/)** — A two-workflow chain that turns a labelled GitHub issue into a merged feature. `kiro-spec` label → spec PR via multi-turn conversation. `kiro-implement` label → implementation PR with one commit per task. Pairs with the PR auto-fix recipe to close the whole loop. The opening minutes of a feature, handled automatically.
+
+Combine the two recipes and the full chain is:
+
+```
+Issue labelled kiro-spec
+  │
+  ▼  issue-to-spec.yml  (spec-driven)
+Spec PR  →  merge
+  │
+  ▼  Issue labelled kiro-implement
+  ▼  spec-to-implementation.yml  (spec-driven)
+Implementation PR
+  │
+  ▼  Bots review
+  ▼  pr-trigger.yml  (pr-auto-fix)
+Fixes applied inline, PR goes green
+  │
+  ▼  Final human review  →  merge
+Feature on main, issue auto-closes
+```
+
+*More recipes coming soon: scheduled code review, release notes generation, steering document patterns.*
 
 ## Using these recipes
 
@@ -20,6 +42,13 @@ The recipes assume:
 - A GitHub repository where you can run Actions
 - A [Kiro account](https://kiro.dev) with an API key (for headless workflows)
 - The `gh` CLI if you're following along with the setup steps
+
+## Companion write-ups
+
+Long-form articles that walk through the design of these recipes and the problems they solve:
+
+- [Part 1: Your PR bots shouldn't just review — they should fix their own findings](https://www.linkedin.com/pulse/your-pr-bots-shouldnt-just-review-they-should-fix-their-own-findings)
+- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/github-issue-merged-pr-kiro-spec-driven)
 
 ## Contributing
 
