@@ -108,6 +108,15 @@ Useful for sweeping findings that predate the workflow or testing the flow witho
 - **Resolve threads after replying**: add a GraphQL `resolveReviewThread` mutation after the reply step
 - **Re-trigger CI on the fix commit**: swap the `GITHUB_TOKEN` push for a PAT or GitHub App token so `pull_request.synchronize` workflows fire
 
+## Related recipes
+
+- **[Spec-driven development](../spec-driven/)** — Pairs naturally with this recipe. When you label a GitHub issue `kiro-spec`, Kiro drafts a spec PR. Label it `kiro-implement` and Kiro opens an implementation PR. That PR is reviewed by your bots, and this workflow (pr-auto-fix) resolves every finding they leave. End-to-end: label → merged feature, with you only in the loop for approvals.
+
+## Companion blog posts
+
+- [Part 1: Your PR bots shouldn't just review — they should fix their own findings](https://www.linkedin.com/pulse/your-pr-bots-shouldnt-just-review-they-should-fix-their-own-findings) — the write-up of this recipe.
+- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/github-issue-merged-pr-kiro-spec-driven) — the write-up of the spec-driven recipe.
+
 ## License
 
 Apache 2.0. See the [LICENSE](../../LICENSE) at the root of the repository.
