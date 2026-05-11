@@ -114,8 +114,8 @@ Useful for sweeping findings that predate the workflow or testing the flow witho
 
 ## Companion blog posts
 
-- [Part 1: Your PR bots shouldn't just review — they should fix their own findings](https://www.linkedin.com/pulse/your-pr-bots-shouldnt-just-review-they-should-fix-their-own-findings) — the write-up of this recipe.
-- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/github-issue-merged-pr-kiro-spec-driven) — the write-up of the spec-driven recipe.
+- [Part 1: How I automated fixing GitHub bot review comments using Kiro and GitHub Actions](https://www.linkedin.com/pulse/how-i-automated-fixing-github-bot-review-comments-using-roberts-t5jqe/) — the write-up of this recipe.
+- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/from-github-issue-merged-pr-without-opening-my-ide-charles-roberts-9qjme/) — the write-up of the spec-driven recipe.
 
 ## License
 
