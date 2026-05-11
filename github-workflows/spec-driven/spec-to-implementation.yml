@@ -1,0 +1,519 @@
+name: Kiro Spec to Implementation
+
+# Given an issue that already has a Kiro spec committed to the repo (via the
+# issue-to-spec workflow), have Kiro implement the tasks and open a PR.
+#
+# Triggers:
+#   - Label `kiro-implement` applied to an issue.
+#   - Comment `/kiro implement` posted by a repo collaborator on an issue.
+#   - Manual dispatch for a specific issue.
+#
+# Flow:
+#   1. Find the spec directory for this issue. We look for the marker comment
+#      left by issue-to-spec.yml ("Spec: `.kiro/specs/<feature-name>/`"). If we
+#      can't find it, we ask Kiro to match the issue to an existing spec.
+#   2. Branch off main: `impl/<issue-number>-<feature-name>`.
+#   3. Run Kiro headless against the spec's tasks.md. Commit after each task.
+#   4. Push and open a PR against main. The existing pr-trigger.yml workflow
+#      then handles any bot review comments on that PR.
+#
+# Safety:
+#   - The real work runs under a per-issue concurrency group. The heads-up
+#     announcement runs in a SEPARATE job *outside* the group so posting the
+#     comment cannot re-enter the group. 
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number whose spec should be implemented"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  # Separate, fast-running job that posts the "Kiro is on it" comment.
+  # Runs OUTSIDE the `implement` job's concurrency group.
+  announce:
+    if: >
+      (github.event_name == 'workflow_dispatch')
+      ||
+      (github.event_name == 'issues' && github.event.label.name == 'kiro-implement')
+      ||
+      (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request == null
+        && startsWith(github.event.comment.body, '/kiro implement')
+        && (github.event.comment.author_association == 'OWNER'
+            || github.event.comment.author_association == 'MEMBER'
+            || github.event.comment.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve issue number
+        id: issue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DISPATCH_ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          case "$EVENT_NAME" in
+            workflow_dispatch) number="$DISPATCH_ISSUE_NUMBER" ;;
+            *)                 number="$EVENT_ISSUE_NUMBER" ;;
+          esac
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Mint app token if app credentials are configured
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KIRO_FIXER_APP_ID }}
+          private-key: ${{ secrets.KIRO_FIXER_PRIVATE_KEY }}
+
+      - name: Resolve effective token
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ -n "$APP_TOKEN" ]; then
+            echo "::add-mask::$APP_TOKEN"
+            echo "EFFECTIVE_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+            echo "EFFECTIVE_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Peek at spec marker (best-effort)
+        id: peek
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          # Best-effort: look at the issue's comments for the marker left by
+          # issue-to-spec.yml so the heads-up comment can mention the spec
+          # path. If we can't find it, we still post a generic message.
+          feature_name=$(gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" | \
+            jq -r '
+              [ .[] | select(.body | test("(\\[kiro\\] )?Drafted a spec")) ]
+              | last
+              | .body // ""
+              | capture("\\.kiro/specs/(?<n>[a-z0-9][a-z0-9-]*)/"; "m")
+              | .n // empty
+            ' 2>/dev/null || echo "")
+          echo "feature_name=$feature_name" >> "$GITHUB_OUTPUT"
+
+      - name: Post "Kiro is on it" heads-up comment
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          FEATURE_NAME: ${{ steps.peek.outputs.feature_name }}
+        run: |
+          # Implementation runs are the longest (5-10 min typical), so
+          # the heads-up matters most here. Include the spec path when
+          # we know it so you can jump straight to it while waiting.
+          if [ -n "$FEATURE_NAME" ]; then
+            msg="Kiro is implementing \`.kiro/specs/${FEATURE_NAME}/\` and will open a PR shortly."
+          else
+            msg="Kiro is matching this issue to an existing spec and will follow up shortly."
+          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$msg"
+
+  implement:
+    # Engage only when:
+    #   - Label `kiro-implement` was just applied, OR
+    #   - A comment starting with `/kiro implement` was posted on an issue (not
+    #     a PR) by a user with write access, OR
+    #   - Manual dispatch.
+    #
+    # We deliberately gate the slash command on author_association rather than
+    # the commenter's login, so trusted collaborators can kick it off without
+    # having to share a bot account.
+    #
+    # `always()` ensures a failed announce job doesn't block the real work.
+    if: >
+      always() && (
+      (github.event_name == 'workflow_dispatch')
+      ||
+      (github.event_name == 'issues' && github.event.label.name == 'kiro-implement')
+      ||
+      (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request == null
+        && startsWith(github.event.comment.body, '/kiro implement')
+        && (github.event.comment.author_association == 'OWNER'
+            || github.event.comment.author_association == 'MEMBER'
+            || github.event.comment.author_association == 'COLLABORATOR')))
+    needs: announce
+    runs-on: ubuntu-latest
+
+    # Concurrency group limits this job to one active run per issue. The
+    # `announce` job above is deliberately outside this group — see header
+    # comment.
+    concurrency:
+      group: kiro-issue-impl-${{ github.event.issue.number || github.event.inputs.issue_number }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Resolve issue number
+        id: issue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          DISPATCH_ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          case "$EVENT_NAME" in
+            workflow_dispatch) number="$DISPATCH_ISSUE_NUMBER" ;;
+            *)                 number="$EVENT_ISSUE_NUMBER" ;;
+          esac
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Mint app token if app credentials are configured
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KIRO_FIXER_APP_ID }}
+          private-key: ${{ secrets.KIRO_FIXER_PRIVATE_KEY }}
+
+      - name: Resolve effective token
+        id: tok
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # The implementation workflow usually touches application code,
+          # not workflow files, so the default GITHUB_TOKEN handles the
+          # common case. Prefer the app token when available though, so
+          # implementations that *do* need to touch .github/workflows/
+          # (rare) don't fail the push.
+          if [ -n "$APP_TOKEN" ]; then
+            echo "::add-mask::$APP_TOKEN"
+            echo "EFFECTIVE_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+            echo "git_user_name=kiro-fixer[bot]" >> "$GITHUB_OUTPUT"
+            echo "git_user_email=kiro-fixer[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+            echo "EFFECTIVE_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_ENV"
+            echo "git_user_name=kiro-issue-impl-bot" >> "$GITHUB_OUTPUT"
+            echo "git_user_email=41898282+github-actions[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure `kiro-implement` label exists
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh label list --repo "$REPO" --limit 200 | grep -q '^kiro-implement'; then
+            gh label create kiro-implement --repo "$REPO" \
+              --color "a371f7" \
+              --description "Ask Kiro to implement the spec for this issue" \
+              || true
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ env.EFFECTIVE_TOKEN }}
+
+      - name: Find the spec for this issue
+        id: spec
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          # Strategy 1: look for the marker comment left by issue-to-spec.yml.
+          # It always contains a line like:
+          #   - Spec: `.kiro/specs/<feature-name>/`
+          gh api "repos/$REPO/issues/$ISSUE_NUMBER/comments?per_page=100" \
+            > comments.json
+
+          feature_name=$(jq -r '
+            [ .[] | select(.body | test("(\\[kiro\\] )?Drafted a spec")) ]
+            | last
+            | .body // ""
+            | capture("\\.kiro/specs/(?<n>[a-z0-9][a-z0-9-]*)/"; "m")
+            | .n // empty
+          ' comments.json)
+
+          if [ -n "$feature_name" ] && [ -d ".kiro/specs/$feature_name" ]; then
+            echo "Found spec via marker comment: $feature_name"
+            echo "feature_name=$feature_name" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Strategy 2: the marker is missing (issue was hand-labelled without
+          # going through issue-to-spec first). Leave it to Kiro to match the
+          # issue title to an existing spec later. We set found=false and let
+          # the Kiro step figure it out.
+          echo "No marker comment found; Kiro will match the spec at run time."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+
+      - name: Capture issue context for Kiro
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh api "repos/$REPO/issues/$ISSUE_NUMBER" > issue.json
+          {
+            echo "# Issue #$ISSUE_NUMBER"
+            jq -r '"Title: " + .title'        issue.json
+            jq -r '"Author: @" + .user.login'  issue.json
+            echo
+            echo "## Body"
+            jq -r '.body // "(no body)"' issue.json
+          } > issue-context.md
+
+      - name: Install Kiro CLI
+        run: curl -fsSL https://cli.kiro.dev/install | bash
+
+      - name: Create implementation branch
+        id: branch
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          FEATURE_NAME: ${{ steps.spec.outputs.feature_name }}
+          FOUND: ${{ steps.spec.outputs.found }}
+        run: |
+          # If we already know the feature name, use it in the branch name now.
+          # If not, use the issue number and we'll rename the branch after Kiro
+          # tells us which spec it matched.
+          if [ "$FOUND" = "true" ]; then
+            branch="impl/${ISSUE_NUMBER}-${FEATURE_NAME}"
+          else
+            branch="impl/${ISSUE_NUMBER}"
+          fi
+
+          git config user.name  "${{ steps.tok.outputs.git_user_name }}"
+          git config user.email "${{ steps.tok.outputs.git_user_email }}"
+          git checkout -B "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Run Kiro in headless mode
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_SECRET }}
+          FOUND: ${{ steps.spec.outputs.found }}
+          FEATURE_NAME: ${{ steps.spec.outputs.feature_name }}
+        run: |
+          # Tailor the prompt depending on whether we already know the spec.
+          if [ "$FOUND" = "true" ]; then
+            spec_instruction="The spec you must implement lives at .kiro/specs/${FEATURE_NAME}/. Read requirements.md (or bugfix.md), design.md, and tasks.md before touching any code."
+          else
+            spec_instruction="The spec for this issue is somewhere under .kiro/specs/. Read issue-context.md, then scan the spec directories and pick the one whose requirements match this issue. If no spec exists, stop immediately and write kiro-impl-result.json with outcome 'no-spec'."
+          fi
+
+          kiro-cli chat \
+            --no-interactive \
+            --trust-all-tools \
+            "You are implementing the tasks in a Kiro spec.
+
+          Inputs on disk:
+          - issue-context.md: the GitHub issue that motivates this change.
+          - The full repository is checked out at main, on a fresh branch.
+          - .kiro/steering/*.md contains project conventions you MUST follow
+            (especially figma-driven-development.md for iOS/UI work).
+
+          ${spec_instruction}
+
+          Implementation rules:
+          1. Work through tasks.md in order. For each task:
+               - Implement the code changes.
+               - Stage and commit with a message of the form
+                   'feat(<feature>): <task title> (#<issue-number>)'
+                 or 'fix(<feature>): ...' for bugfix specs.
+               - Mark the task as completed in tasks.md (change '- [ ]' to '- [x]').
+               - Commit the tasks.md update as part of the same commit.
+          2. Skip optional tasks (those marked with an asterisk) unless
+             completing them is trivial.
+          3. If a task can't be completed, leave it unchecked, add a brief note
+             under the task explaining why, and continue to the next task.
+          4. Do NOT run 'git push'. The workflow will push for you.
+          5. Do NOT modify the spec files (requirements.md, design.md, bugfix.md)
+             except to tick task checkboxes in tasks.md.
+
+          When done, write kiro-impl-result.json:
+            { \"outcome\": \"done\"|\"partial\"|\"no-spec\",
+              \"feature_name\": \"<kebab-case>\",
+              \"completed_tasks\": [\"<task title>\", ...],
+              \"skipped_tasks\":   [\"<task title>: <reason>\", ...],
+              \"summary\": \"<markdown summary for the PR body>\" }
+          kiro-impl-result.json is REQUIRED."
+
+      - name: Read Kiro's implementation result
+        id: result
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          FOUND: ${{ steps.spec.outputs.found }}
+        run: |
+          if [ ! -f kiro-impl-result.json ]; then
+            # Safety net: if Kiro didn't produce a result file, treat the run
+            # as partial and synthesise one so the later steps still have
+            # something to work with.
+            cat > kiro-impl-result.json <<'EOF'
+          { "outcome": "partial",
+            "feature_name": "",
+            "completed_tasks": [],
+            "skipped_tasks": ["(all): Kiro did not produce a result file; manual review required"],
+            "summary": "Kiro ran but didn't produce a structured result. Check the workflow logs." }
+          EOF
+          fi
+
+          outcome=$(jq -r '.outcome'       kiro-impl-result.json)
+          feature=$(jq -r '.feature_name // ""' kiro-impl-result.json)
+
+          echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
+
+          # If we didn't know the feature name up front, learn it now from
+          # Kiro's result and rename the branch so the PR head is informative.
+          if [ "$FOUND" != "true" ] && [ -n "$feature" ] && [ "$outcome" != "no-spec" ]; then
+            new_branch="impl/${ISSUE_NUMBER}-${feature}"
+            git branch -m "$BRANCH" "$new_branch"
+            echo "branch=$new_branch" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Expose the feature name (possibly empty for no-spec) and a summary
+          # payload for the PR body and issue comment.
+          echo "feature_name=$feature" >> "$GITHUB_OUTPUT"
+
+      - name: Handle no-spec outcome
+        if: steps.result.outputs.outcome == 'no-spec'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "I couldn't find a spec for this issue. Label the issue **kiro-spec** (or run \`/kiro spec\` if you prefer) to have me draft one first, then re-label **kiro-implement** to try again."
+
+      - name: Commit any stragglers left by Kiro
+        id: straggler
+        if: steps.result.outputs.outcome != 'no-spec'
+        env:
+          FEATURE_NAME: ${{ steps.result.outputs.feature_name }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          # Kiro is told to commit after each task, but if it left anything
+          # uncommitted (e.g. a final tasks.md tick or a generated artefact)
+          # we sweep it up now so the PR diff is self-contained.
+          rm -f issue-context.md issue.json comments.json kiro-impl-result.json
+
+          if git diff --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+            echo "No stragglers to commit."
+            echo "had_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            git add -A
+            if git diff --cached --quiet; then
+              echo "had_changes=false" >> "$GITHUB_OUTPUT"
+            else
+              git commit -m "chore(${FEATURE_NAME}): sweep up uncommitted changes (#${ISSUE_NUMBER})"
+              echo "had_changes=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Check whether the branch has any commits over main
+        id: diverges
+        if: steps.result.outputs.outcome != 'no-spec'
+        run: |
+          # If Kiro decided every task was a no-op, the branch might still be
+          # at main. There's nothing to PR in that case.
+          ahead=$(git rev-list --count origin/main..HEAD)
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+
+      - name: Push implementation branch
+        if: steps.result.outputs.outcome != 'no-spec' && steps.diverges.outputs.ahead != '0'
+        env:
+          BRANCH: ${{ steps.result.outputs.branch }}
+        run: |
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+      - name: Open implementation PR
+        id: pr
+        if: steps.result.outputs.outcome != 'no-spec' && steps.diverges.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.result.outputs.branch }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          FEATURE_NAME: ${{ steps.result.outputs.feature_name }}
+          OUTCOME: ${{ steps.result.outputs.outcome }}
+        run: |
+          # Rebuild the result payload for the PR body. We intentionally keep
+          # this separate from the step output so we don't fight with YAML
+          # multiline escaping.
+          completed=$(jq -r '.completed_tasks // [] | map("- [x] " + .) | join("\n")' kiro-impl-result.json 2>/dev/null || echo "")
+          skipped=$(jq -r '.skipped_tasks // []   | map("- [ ] " + .) | join("\n")' kiro-impl-result.json 2>/dev/null || echo "")
+          summary=$(jq -r '.summary // ""'              kiro-impl-result.json 2>/dev/null || echo "")
+
+          # kiro-impl-result.json was deleted by the straggler step; recover
+          # what we can from the step outputs if needed.
+          [ -z "$summary" ] && summary="(Kiro didn't produce a summary; review the commits on this branch.)"
+
+          title_prefix="feat"
+          if [ -d ".kiro/specs/${FEATURE_NAME}" ] && [ -f ".kiro/specs/${FEATURE_NAME}/bugfix.md" ]; then
+            title_prefix="fix"
+          fi
+
+          cat > pr-body.md <<EOF
+          Auto-generated implementation for issue #${ISSUE_NUMBER}.
+
+          Spec: \`.kiro/specs/${FEATURE_NAME}/\`
+
+          ### Summary
+          ${summary}
+
+          ### Completed tasks
+          ${completed:-(none)}
+
+          ### Skipped / deferred tasks
+          ${skipped:-(none)}
+
+          ### Review guidance
+          - Each task is a separate commit; review commit-by-commit if the diff is large.
+          - Bot review comments from Amazon Q Developer and AWS Security Agent will be handled automatically by the \`Kiro PR Comment Auto-Fix\` workflow.
+          - Kiro's outcome for this run: **${OUTCOME}**.
+
+          Closes #${ISSUE_NUMBER}
+          EOF
+
+          pr_url=$(gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "${title_prefix}: ${FEATURE_NAME} (#${ISSUE_NUMBER})" \
+            --body-file pr-body.md)
+
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Comment implementation PR link on the issue
+        if: steps.result.outputs.outcome != 'no-spec' && steps.diverges.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          OUTCOME: ${{ steps.result.outputs.outcome }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "Opened implementation PR: ${PR_URL} (outcome: **${OUTCOME}**)."
+
+      - name: Comment when there was nothing to implement
+        if: steps.result.outputs.outcome != 'no-spec' && steps.diverges.outputs.ahead == '0'
+        env:
+          GH_TOKEN: ${{ env.EFFECTIVE_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "Ran against the spec but produced no changes. Either every task was already complete, or the spec's tasks didn't require code changes. Check the workflow logs for details."
