@@ -159,8 +159,8 @@ A few adjustment points:
 
 ## Companion blog posts
 
-- [Part 1: Your PR bots shouldn't just review — they should fix their own findings](https://www.linkedin.com/pulse/your-pr-bots-shouldnt-just-review-they-should-fix-their-own-findings)
-- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/github-issue-merged-pr-kiro-spec-driven)
+- [Part 1: How I automated fixing GitHub bot review comments using Kiro and GitHub Actions](https://www.linkedin.com/pulse/how-i-automated-fixing-github-bot-review-comments-using-roberts-t5jqe/)
+- [Part 2: From GitHub issue to merged PR, without opening my IDE](https://www.linkedin.com/pulse/from-github-issue-merged-pr-without-opening-my-ide-charles-roberts-9qjme/)
 
 ## Licence
 
